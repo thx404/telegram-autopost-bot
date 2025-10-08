@@ -1,96 +1,68 @@
-import json
 import asyncio
-from datetime import datetime, timedelta
-from telegram import Update, InputFile
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes, CommandHandler
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import datetime, time, timedelta
+from telegram import Bot
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+import logging
 
-# === CONFIGURAÇÕES ===
-BOT_TOKEN = "8477842120:AAF9qg6-84vhgEpTW_WKlCSqwv135TPRWVI"
-GRUPO_POSTAGEM = -1002261068752  # coloque aqui o ID do grupo onde o bot deve postar
-ARQUIVO_POSTS = "posts.json"
+# --- CONFIGURAÇÕES ---
+BOT_TOKEN = "CO8477842120:AAF9qg6-84vhgEpTW_WKlCSqwv135TPRWVI"
+SOURCE_CHAT_ID = -4945037700   # grupo onde você coloca os posts prontos
+TARGET_CHAT_ID = -1002261068752   # grupo onde o bot vai postar automaticamente
+POST_HOUR = 10  # hora da postagem (ex: 10 = 10h da manhã)
 
-# === AGENDADOR ===
-scheduler = AsyncIOScheduler()
-scheduler.start()
+# --- LOG ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-# === FUNÇÃO PARA SALVAR POSTS ===
-def salvar_post(post):
+# --- FUNÇÕES ---
+async def copiar_ultimo_post(bot: Bot):
+    """Copia o último post do grupo SOURCE e envia pro grupo TARGET"""
     try:
-        with open(ARQUIVO_POSTS, "r", encoding="utf-8") as f:
-            posts = json.load(f)
-    except:
-        posts = []
-    posts.append(post)
-    with open(ARQUIVO_POSTS, "w", encoding="utf-8") as f:
-        json.dump(posts, f, indent=2, ensure_ascii=False)
+        mensagens = await bot.get_chat_history(chat_id=SOURCE_CHAT_ID, limit=1)
+        if not mensagens:
+            print("Nenhuma mensagem encontrada no grupo fonte.")
+            return
 
-# === QUANDO RECEBE MENSAGEM ===
-async def receber_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
+        msg = mensagens[0]
+        caption = msg.caption or msg.text or ""
 
-    # pega o tipo de conteúdo
-    conteudo = {}
-    if msg.text:
-        conteudo["texto"] = msg.text
-    if msg.photo:
-        conteudo["foto"] = msg.photo[-1].file_id
-    if msg.video:
-        conteudo["video"] = msg.video.file_id
+        # envia conforme o tipo
+        if msg.photo:
+            await bot.send_photo(chat_id=TARGET_CHAT_ID, photo=msg.photo[-1].file_id, caption=caption)
+        elif msg.video:
+            await bot.send_video(chat_id=TARGET_CHAT_ID, video=msg.video.file_id, caption=caption)
+        else:
+            await bot.send_message(chat_id=TARGET_CHAT_ID, text=caption)
 
-    if not conteudo:
-        await msg.reply_text("Envie um texto, foto ou vídeo para agendar.")
-        return
+        print(f"✅ Postagem enviada para o grupo destino às {datetime.now().strftime('%H:%M:%S')}")
+    except Exception as e:
+        print(f"❌ Erro ao copiar post: {e}")
 
-    await msg.reply_text("Que horas você quer postar isso? (ex: 20:30)")
-    context.user_data["conteudo"] = conteudo
-
-# === QUANDO RECEBE O HORÁRIO ===
-async def receber_horario(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    texto = update.message.text.strip()
-    try:
-        hora, minuto = map(int, texto.split(":"))
+async def agendar_post(bot: Bot):
+    """Agenda a postagem para o horário configurado"""
+    while True:
         agora = datetime.now()
-        agendado = agora.replace(hour=hora, minute=minuto, second=0, microsecond=0)
-        if agendado < agora:
-            agendado += timedelta(days=1)  # se já passou, agenda pra amanhã
-    except:
-        await update.message.reply_text("Formato inválido. Use HH:MM (ex: 20:30)")
-        return
+        proximo = datetime.combine(agora.date(), time(POST_HOUR))  # hora configurada
+        if agora >= proximo:
+            proximo += timedelta(days=1)  # joga pra amanhã se já passou
 
-    conteudo = context.user_data.get("conteudo")
-    if not conteudo:
-        await update.message.reply_text("Envie primeiro o conteúdo do post.")
-        return
+        tempo_espera = (proximo - agora).total_seconds()
+        print(f"⏰ Próxima postagem programada para: {proximo.strftime('%H:%M:%S')}")
+        await asyncio.sleep(tempo_espera)
+        await copiar_ultimo_post(bot)
 
-    post = {"conteudo": conteudo, "horario": agendado.isoformat()}
-    salvar_post(post)
+async def start(update, context):
+    await update.message.reply_text("🚀 Bot de postagens automáticas ativo!")
 
-    scheduler.add_job(postar, "date", run_date=agendado, args=[conteudo, context])
-    await update.message.reply_text(f"Post agendado para {agendado.strftime('%H:%M')} ✅")
-
-# === FUNÇÃO PARA POSTAR NO GRUPO ===
-async def postar(conteudo, context):
-    chat_id = GRUPO_POSTAGEM
-
-    if "foto" in conteudo:
-        await context.bot.send_photo(chat_id, conteudo["foto"], caption=conteudo.get("texto", ""))
-    elif "video" in conteudo:
-        await context.bot.send_video(chat_id, conteudo["video"], caption=conteudo.get("texto", ""))
-    elif "texto" in conteudo:
-        await context.bot.send_message(chat_id, conteudo["texto"])
-
-# === COMANDO /start ===
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Olá! Envie uma foto, vídeo ou texto para agendar a postagem.")
-
-# === FUNÇÃO PRINCIPAL ===
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.TEXT & (~filters.COMMAND), receber_mensagem))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), receber_horario))
+
+    bot = Bot(BOT_TOKEN)
+    asyncio.create_task(agendar_post(bot))  # roda em paralelo
 
     print("🤖 Bot rodando...")
     await app.run_polling()
